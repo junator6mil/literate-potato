@@ -6,10 +6,12 @@ OWNER: TM4 — Gesture Recognition Developer
 Provides the GestureRecognizer class that analyzes MediaPipe hand landmarks
 to determine which gesture is being made.
 
-IMPLEMENTATION ADAPTED FROM:
-    TM3's standalone module at gesture_recognition/recognizer.py
-    Original standalone functions have been wrapped in the GestureRecognizer
-    class to match the team's interface contract.
+This implementation is lightweight, uses only the MediaPipe landmark geometry,
+and includes a stability system that requires a gesture to be seen for
+GESTURE_STABILITY_FRAMES consecutive frames before it is confirmed.
+
+No external ML libraries are used.  The code is deliberately simple and
+heavily commented so that it can be explained easily during a presentation.
 
 INTERFACE CONTRACT (DO NOT change these method signatures):
     class GestureRecognizer:
@@ -23,287 +25,241 @@ INTERFACE CONTRACT (DO NOT change these method signatures):
 See config.py for: GESTURE_MAP, GESTURE_STABILITY_FRAMES
 """
 
+from __future__ import annotations
+
 import math
+from typing import List
+
 from config import GESTURE_MAP, GESTURE_STABILITY_FRAMES
 
 
-# ═══════════════════════════════════════════════════════════════════
-# LANDMARK INDEX CONSTANTS
-# ═══════════════════════════════════════════════════════════════════
-# Named constants for each of the 21 hand landmarks.
-# These are identical to the ones in config.py's LANDMARK_NAMES but
-# stored as simple integers for fast access in recognition logic.
+# ---------------------------------------------------------------------------
+# Helper functions
+# ---------------------------------------------------------------------------
 
-WRIST = 0
+def _extract_landmarks(landmarks) -> List[object]:
+    """Return a flat list of landmark objects.
 
-# Thumb
-THUMB_CMC = 1
-THUMB_MCP = 2
-THUMB_IP  = 3
-THUMB_TIP = 4
+    MediaPipe's ``NormalizedLandmarkList`` exposes the landmarks via a
+    ``.landmark`` attribute, while a simple ``list`` of ``NormalizedLandmark``
+    objects can be passed directly.  This helper abstracts that difference.
+    """
+    if hasattr(landmarks, "landmark"):
+        return list(landmarks.landmark)
+    return list(landmarks)
 
-# Index finger
-INDEX_MCP = 5
-INDEX_PIP = 6
-INDEX_DIP = 7
-INDEX_TIP = 8
 
-# Middle finger
-MIDDLE_MCP = 9
+def _is_finite_number(value) -> bool:
+    """Check that *value* is a real, finite number (not NaN/inf)."""
+    return isinstance(value, (int, float)) and math.isfinite(value)
+
+
+# ---------------------------------------------------------------------------
+# Landmark index constants (for readability)
+# ---------------------------------------------------------------------------
+
+WRIST      = 0
+THUMB_MCP  = 2
+THUMB_IP   = 3
+THUMB_TIP  = 4
+INDEX_PIP  = 6
+INDEX_TIP  = 8
 MIDDLE_PIP = 10
-MIDDLE_DIP = 11
 MIDDLE_TIP = 12
+RING_PIP   = 14
+RING_TIP   = 16
+PINKY_PIP  = 18
+PINKY_TIP  = 20
 
-# Ring finger
-RING_MCP = 13
-RING_PIP = 14
-RING_DIP = 15
-RING_TIP = 16
-
-# Pinky
-PINKY_MCP = 17
-PINKY_PIP = 18
-PINKY_DIP = 19
-PINKY_TIP = 20
+# Indices that must have valid coordinates for recognition to proceed
+_REQUIRED_INDICES = [WRIST, THUMB_MCP, THUMB_IP, THUMB_TIP,
+                     INDEX_PIP, INDEX_TIP, MIDDLE_PIP, MIDDLE_TIP,
+                     RING_PIP, RING_TIP, PINKY_PIP, PINKY_TIP]
 
 
-# ═══════════════════════════════════════════════════════════════════
-# HELPER FUNCTIONS — LANDMARK COORDINATE ACCESS
-# ═══════════════════════════════════════════════════════════════════
-# MediaPipe landmarks can come in different forms:
-#   1. From mp.solutions.hands:  results.multi_hand_landmarks[0].landmark[i]
-#      -> each has .x, .y, .z attributes
-#   2. As tuples: (x, y, z) from manual conversion
-#
-# These helpers handle both formats using hasattr().
-
-def _get_x(landmark):
-    """Get x-coordinate from a landmark (supports .x attribute or tuple)."""
-    if hasattr(landmark, 'x'):
-        return landmark.x
-    return landmark[0]
-
-
-def _get_y(landmark):
-    """Get y-coordinate (y=0 is TOP, y=1 is BOTTOM of image)."""
-    if hasattr(landmark, 'y'):
-        return landmark.y
-    return landmark[1]
-
-
-# ═══════════════════════════════════════════════════════════════════
-# FINGER STATE DETECTION — CORE LOGIC
-# ═══════════════════════════════════════════════════════════════════
-# A finger is "extended" when its tip is ABOVE (lower y value) its
-# PIP joint.  The thumb is special — it moves sideways, so we check
-# x-coordinates and use the handedness parameter to know which
-# direction means "extended".
-
-def _is_finger_extended(landmarks, tip_idx, pip_idx, mcp_idx):
-    """
-    Check if a non-thumb finger is extended (pointing upward).
-
-    Logic: tip.y < pip.y AND tip.y < mcp.y
-    (lower y = higher on screen = finger pointing up)
-    """
-    tip_y = _get_y(landmarks[tip_idx])
-    pip_y = _get_y(landmarks[pip_idx])
-    mcp_y = _get_y(landmarks[mcp_idx])
-    return tip_y < pip_y and tip_y < mcp_y
-
-
-def _is_thumb_extended(landmarks, is_right_hand):
-    """
-    Check if the thumb is extended outward from the palm.
-
-    Uses x-coordinates because the thumb moves sideways:
-    - Right hand: thumb extends LEFT  -> thumb_tip.x < thumb_ip.x
-    - Left hand:  thumb extends RIGHT -> thumb_tip.x > thumb_ip.x
-
-    Args:
-        landmarks: list of 21 landmark objects
-        is_right_hand: True if the hand is a right hand
-    """
-    thumb_tip_x = _get_x(landmarks[THUMB_TIP])
-    thumb_ip_x  = _get_x(landmarks[THUMB_IP])
-    thumb_mcp_x = _get_x(landmarks[THUMB_MCP])
-
-    min_extension = 0.02  # minimum distance to count as extended
-
-    if is_right_hand:
-        return (thumb_tip_x < thumb_ip_x and
-                abs(thumb_tip_x - thumb_mcp_x) > min_extension)
-    else:
-        return (thumb_tip_x > thumb_ip_x and
-                abs(thumb_tip_x - thumb_mcp_x) > min_extension)
-
-
-def _is_thumb_pointing_up(landmarks):
-    """
-    Check if thumb points UPWARD (for thumbs_up gesture).
-    Thumb tip must be significantly above thumb MCP and above wrist.
-    """
-    thumb_tip_y = _get_y(landmarks[THUMB_TIP])
-    thumb_mcp_y = _get_y(landmarks[THUMB_MCP])
-    wrist_y     = _get_y(landmarks[WRIST])
-    return (thumb_tip_y < thumb_mcp_y - 0.05 and
-            thumb_tip_y < wrist_y)
-
-
-def _is_thumb_pointing_down(landmarks):
-    """
-    Check if thumb points DOWNWARD (for thumbs_down gesture).
-    Thumb tip must be significantly below thumb MCP and below wrist.
-    """
-    thumb_tip_y = _get_y(landmarks[THUMB_TIP])
-    thumb_mcp_y = _get_y(landmarks[THUMB_MCP])
-    wrist_y     = _get_y(landmarks[WRIST])
-    return (thumb_tip_y > thumb_mcp_y + 0.05 and
-            thumb_tip_y > wrist_y)
-
-
-# ═══════════════════════════════════════════════════════════════════
-# THE GESTURE RECOGNIZER CLASS
-# ═══════════════════════════════════════════════════════════════════
-# This class wraps the recognition logic to match the team's
-# interface contract.  The key differences from the standalone
-# module:
-#   1. Methods live on a class instead of being module-level functions
-#   2. "handedness" is passed in explicitly (not auto-detected)
-#   3. Return values are lowercase config.py keys, not uppercase labels
-#   4. None is mapped to "unknown"
+# ═══════════════════════════════════════════════════════════════════════════
+# GestureRecognizer class
+# ═══════════════════════════════════════════════════════════════════════════
 
 class GestureRecognizer:
-    """Classifies hand gestures using rule-based finger position analysis."""
+    """Classifies hand gestures using rule-based finger position analysis.
 
-    def __init__(self):
-        # Validate that our gesture keys match config.GESTURE_MAP
-        self._required_keys = set(GESTURE_MAP.keys()) - {"unknown"}
+    The public API consists of ``__init__``, ``get_finger_states`` and
+    ``recognize``.  Internally the class maintains a small amount of state
+    to implement the *gesture stability* requirement.
+    """
 
-    def get_finger_states(self, landmarks, handedness: str = "Right") -> list:
+    # -----------------------------------------------------------------
+    # Internal state initialisation
+    # -----------------------------------------------------------------
+    def __init__(self) -> None:
+        """Initialise the recogniser.
+
+        * ``_candidate_gesture`` – the gesture currently being counted
+          (or ``None`` if the last frame was invalid / unknown).
+        * ``_prev_gesture`` – the last *confirmed* gesture that satisfied
+          the stability requirement.
+        * ``_consecutive_count`` – how many consecutive frames the current
+          candidate has been observed.
         """
-        Determine which fingers are extended.
+        self._candidate_gesture: str | None = None
+        self._prev_gesture: str | None = None
+        self._consecutive_count: int = 0
+
+    # -----------------------------------------------------------------
+    # Finger state detection
+    # -----------------------------------------------------------------
+    def get_finger_states(
+        self,
+        landmarks,
+        handedness: str = "Right",
+    ) -> list[bool]:
+        """Determine which fingers are extended.
 
         Args:
-            landmarks: MediaPipe NormalizedLandmarkList (has .landmark attribute)
-                       OR a plain list of 21 objects with .x, .y, .z
-            handedness: "Left" or "Right" (from MediaPipe multi_handedness)
+            landmarks: MediaPipe NormalizedLandmarkList (has .landmark
+                       attribute) OR a plain list/tuple of 21+ objects
+                       each with ``.x`` and ``.y`` attributes.
+            handedness: ``"Left"`` or ``"Right"`` (case-insensitive).
+                        Determines the thumb direction rule.
 
         Returns:
-            List of 5 booleans: [thumb, index, middle, ring, pinky]
-            True means the finger is extended/open.
+            ``[thumb, index, middle, ring, pinky]`` — ``True`` = extended.
+
+        Raises:
+            ValueError: If the input is malformed or contains non-numeric
+                        coordinates.
         """
-        # Normalize input: if it's a NormalizedLandmarkList, access .landmark
-        lm = self._normalize_landmarks(landmarks)
-        if lm is None:
-            return [False, False, False, False, False]
+        # --- Normalise handedness -------------------------------------------
+        handedness_norm = handedness.strip().lower()
+        if handedness_norm not in {"left", "right"}:
+            raise ValueError(f"Invalid handedness: {handedness}")
 
-        is_right = (handedness == "Right")
+        # --- Extract landmark list ------------------------------------------
+        lm = _extract_landmarks(landmarks)
+        if len(lm) < 21:
+            raise ValueError("Expected at least 21 hand landmarks")
 
-        thumb  = _is_thumb_extended(lm, is_right)
-        index  = _is_finger_extended(lm, INDEX_TIP,  INDEX_PIP,  INDEX_MCP)
-        middle = _is_finger_extended(lm, MIDDLE_TIP, MIDDLE_PIP, MIDDLE_MCP)
-        ring   = _is_finger_extended(lm, RING_TIP,   RING_PIP,   RING_MCP)
-        pinky  = _is_finger_extended(lm, PINKY_TIP,  PINKY_PIP,  PINKY_MCP)
+        # --- Validate required landmark coordinates -------------------------
+        for i in _REQUIRED_INDICES:
+            pt = lm[i]
+            if not (_is_finite_number(getattr(pt, "x", None))
+                    and _is_finite_number(getattr(pt, "y", None))):
+                raise ValueError(f"Invalid coordinates for landmark {i}")
 
-        return [thumb, index, middle, ring, pinky]
+        # --- Thumb detection (x-axis, handedness-dependent) -----------------
+        # Right hand: thumb tip is to the LEFT of the IP joint (smaller x).
+        # Left hand:  thumb tip is to the RIGHT of the IP joint (larger x).
+        thumb_extended: bool = (
+            lm[THUMB_TIP].x < lm[THUMB_IP].x
+            if handedness_norm == "right"
+            else lm[THUMB_TIP].x > lm[THUMB_IP].x
+        )
 
+        # --- Four fingers (y-axis) ------------------------------------------
+        # MediaPipe y increases downward, so a smaller tip.y means the
+        # finger is pointing upward → extended.
+        index_extended:  bool = lm[INDEX_TIP].y  < lm[INDEX_PIP].y
+        middle_extended: bool = lm[MIDDLE_TIP].y < lm[MIDDLE_PIP].y
+        ring_extended:   bool = lm[RING_TIP].y   < lm[RING_PIP].y
+        pinky_extended:  bool = lm[PINKY_TIP].y  < lm[PINKY_PIP].y
+
+        return [thumb_extended, index_extended, middle_extended,
+                ring_extended, pinky_extended]
+
+    # -----------------------------------------------------------------
+    # Gesture classification + stability
+    # -----------------------------------------------------------------
     def recognize(self, hand_landmarks, handedness: str = "Right") -> str:
-        """
-        Analyze hand landmarks and return the gesture name.
+        """Analyse hand landmarks and return a stable gesture key.
 
         Args:
-            hand_landmarks: MediaPipe NormalizedLandmarkList with 21 landmarks.
-                            OR a plain list of 21 objects with .x, .y, .z
-            handedness: "Left" or "Right" — needed for thumb detection.
+            hand_landmarks: MediaPipe NormalizedLandmarkList with 21
+                            landmarks, or equivalent sequence.
+            handedness: ``"Left"`` or ``"Right"`` (case-insensitive).
 
         Returns:
-            A key from config.GESTURE_MAP (e.g., "thumbs_up", "peace", "unknown")
+            A key from ``config.GESTURE_MAP`` (e.g. ``"peace"``,
+            ``"thumbs_up"``), or ``"unknown"`` when the gesture cannot
+            be determined or has not yet met the stability threshold.
         """
-        # Normalize input
-        lm = self._normalize_landmarks(hand_landmarks)
-        if lm is None:
+        # --- Step 1: get finger states (resets on error) --------------------
+        try:
+            finger_states = self.get_finger_states(hand_landmarks, handedness)
+        except Exception:
+            # Invalid input → reset pending candidate and counter
+            self._candidate_gesture = None
+            self._consecutive_count = 0
             return "unknown"
 
-        # Get finger states
-        fingers = self.get_finger_states(hand_landmarks, handedness)
-        thumb, index, middle, ring, pinky = fingers
-        extended_count = sum(fingers)
+        # --- Step 2: map finger pattern to a candidate gesture key ----------
+        pattern = tuple(finger_states)
 
-        # ─── GESTURE MATCHING (most specific → least specific) ───
+        # Lookup table  — (thumb, index, middle, ring, pinky) → gesture key
+        _PATTERN_TO_GESTURE = {
+            (True,  True,  True,  True,  True):  "open_palm",
+            (False, False, False, False, False):  "fist",
+            (True,  False, False, False, False):  "thumbs_up",   # refined below
+            (False, True,  True,  False, False):  "peace",
+            (False, True,  False, False, False):  "point",
+            (False, True,  True,  True,  False):  "three",
+            (False, True,  True,  True,  True):   "four",
+            (False, True,  False, False, True):   "rock",
+            (True,  False, False, False, True):   "call_me",
+        }
 
-        # THUMBS UP: only thumb visible, pointing upward
-        if (not index and not middle and not ring and not pinky
-                and _is_thumb_pointing_up(lm)):
-            return "thumbs_up"
+        candidate = _PATTERN_TO_GESTURE.get(pattern, "unknown")
 
-        # THUMBS DOWN: only thumb visible, pointing downward
-        if (not index and not middle and not ring and not pinky
-                and _is_thumb_pointing_down(lm)):
-            return "thumbs_down"
+        # --- Step 3: thumbs-up vs thumbs-down direction check ---------------
+        # Both gestures share the pattern (True, False, False, False, False).
+        # We compare thumb tip Y with wrist Y to tell them apart.
+        if candidate == "thumbs_up":          # the only key the pattern maps to
+            lm = _extract_landmarks(hand_landmarks)
+            thumb_tip_y = lm[THUMB_TIP].y
+            wrist_y     = lm[WRIST].y
 
-        # FIST: all fingers curled
-        if extended_count == 0:
-            return "fist"
+            if thumb_tip_y < wrist_y:
+                candidate = "thumbs_up"       # tip above wrist → up
+            elif thumb_tip_y > wrist_y:
+                candidate = "thumbs_down"     # tip below wrist → down
+            else:
+                candidate = "unknown"         # ambiguous
 
-        # POINT: only index finger extended
-        if not thumb and index and not middle and not ring and not pinky:
-            return "point"
+        # --- Step 4: stability logic ----------------------------------------
+        if candidate == "unknown":
+            self._candidate_gesture = None
+            self._consecutive_count = 0
+            return "unknown"
 
-        # PEACE (V sign): index + middle extended, rest curled
-        if not thumb and index and middle and not ring and not pinky:
-            return "peace"
+        # Already confirmed and still the same → keep returning it
+        if self._prev_gesture == candidate:
+            return candidate
 
-        # THREE: index + middle + ring extended
-        if not thumb and index and middle and ring and not pinky:
-            return "three"
+        # New or continuing candidate
+        if self._candidate_gesture != candidate:
+            # Different from what we were counting → start fresh
+            self._candidate_gesture = candidate
+            self._consecutive_count = 1
+        else:
+            self._consecutive_count += 1
 
-        # FOUR: all except thumb extended
-        if not thumb and index and middle and ring and pinky:
-            return "four"
+        # Check if we have reached the stability threshold
+        if self._consecutive_count >= GESTURE_STABILITY_FRAMES:
+            self._prev_gesture = candidate
+            return candidate
 
-        # ROCK: index + pinky extended (devil horns)
-        if not thumb and index and not middle and not ring and pinky:
-            return "rock"
-
-        # CALL ME: thumb + pinky extended
-        if thumb and not index and not middle and not ring and pinky:
-            return "call_me"
-
-        # OPEN PALM: all (or 4+) fingers extended
-        if index and middle and ring and pinky and extended_count >= 4:
-            return "open_palm"
-
-        # No match
+        # Not stable yet
         return "unknown"
 
-    def _normalize_landmarks(self, landmarks):
+    # -----------------------------------------------------------------
+    # Optional manual reset
+    # -----------------------------------------------------------------
+    def reset(self) -> None:
+        """Reset internal stability counters.
+
+        Not used by the core recognition logic, but available for the
+        GUI to call when the video stream is stopped and restarted.
         """
-        Convert various landmark input formats to a plain list.
-
-        MediaPipe results come as NormalizedLandmarkList objects
-        which have a .landmark attribute containing the actual list.
-        TM2's hand_detector passes these directly.
-
-        We also handle plain lists (for testing) and validate length.
-
-        Returns:
-            list of 21 landmarks, or None if input is invalid.
-        """
-        if landmarks is None:
-            return None
-
-        # If it's a MediaPipe NormalizedLandmarkList, extract .landmark
-        if hasattr(landmarks, 'landmark'):
-            lm = landmarks.landmark
-        else:
-            lm = landmarks
-
-        # Validate length
-        try:
-            if len(lm) != 21:
-                return None
-        except TypeError:
-            return None
-
-        return lm
+        self._candidate_gesture = None
+        self._prev_gesture = None
+        self._consecutive_count = 0
