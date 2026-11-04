@@ -29,3 +29,7 @@ desktop.ini
 # Misc
 *.log
 .pytest_cache/
+
+# Model files
+*.task
+
